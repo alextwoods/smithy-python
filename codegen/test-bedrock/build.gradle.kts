@@ -13,8 +13,23 @@
  * permissions and limitations under the License.
  */
 
-rootProject.name = "smithy-python"
-include(":core")
-include(":protocol-test")
-include(":aws:core")
-include("test-bedrock")
+description = "Test Build for Bedrock"
+extra["displayName"] = "Smithy :: Python :: Aws :: BedrockTest"
+extra["moduleName"] = "software.amazon.smithy.python.Aws.BedrockTest"
+
+plugins {
+    java
+    alias(libs.plugins.smithy.gradle.base)
+}
+
+repositories {
+    mavenLocal()
+    mavenCentral()
+}
+
+dependencies {
+    implementation(project(":core"))
+    implementation(project(":aws:core"))
+    implementation(libs.smithy.aws.traits)
+    implementation(libs.smithy.aws.endpoints)
+}

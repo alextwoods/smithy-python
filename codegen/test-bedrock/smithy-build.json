@@ -1,0 +1,15 @@
+{
+    "version": "1.0",
+    "sources": ["model"],
+    "projections": {
+        "client": {
+            "plugins": {
+                "python-client-codegen": {
+                    "service": "com.amazonaws.bedrockruntime#AmazonBedrockFrontendService",
+                    "module": "bedrock_runtime",
+                    "moduleVersion": "0.0.1"
+                }
+            }
+        }
+    }
+}
