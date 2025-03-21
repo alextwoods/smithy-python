@@ -260,7 +260,7 @@ class AWSCRTHTTPClient(http_aio_interfaces.HTTPClient):
         return response
 
     def _close_input_body(
-        self, future: ConcurrentFuture[int], *, body: "PipeByteStream | BytesIO"
+        self, future: ConcurrentFuture[int], *, body: "BufferableByteStream | PipeByteStream | BytesIO"
     ) -> None:
         if future.exception(timeout=0):
             body.close()
@@ -337,7 +337,7 @@ class AWSCRTHTTPClient(http_aio_interfaces.HTTPClient):
 
     async def _marshal_request(
         self, request: http_aio_interfaces.HTTPRequest
-    ) -> tuple["crt_http.HttpRequest", "PipeByteStream | BytesIO"]:
+    ) -> tuple["crt_http.HttpRequest", "BufferableByteStream | PipeByteStream | BytesIO"]:
         """Create :py:class:`awscrt.http.HttpRequest` from
         :py:class:`smithy_http.aio.HTTPRequest`"""
         headers_list = []
@@ -369,7 +369,12 @@ class AWSCRTHTTPClient(http_aio_interfaces.HTTPClient):
             # it into the intermediate object that CRT needs. By using
             # asyncio.create_task we'll start the coroutine without having to
             # explicitly await it.
-            crt_body = PipeByteStream()
+            if hasattr(crt_http, "PipeInputStream"):
+                crt_body = PipeByteStream()
+                body_stream = crt_http.PipeInputStream(crt_body)
+            else:
+                crt_body = BufferableByteStream()
+                body_stream = crt_body
 
             if not isinstance(body, AsyncIterable):
                 body = AsyncBytesReader(body)
@@ -377,7 +382,7 @@ class AWSCRTHTTPClient(http_aio_interfaces.HTTPClient):
             # Start the read task in the background.
             read_task = asyncio.create_task(self._consume_body_async(body, crt_body))
 
-            # Keep track of the read task so that it doesn't get garbage colllected,
+            # Keep track of the read task so that it doesn't get garbage collected,
             # and stop tracking it once it's done.
             self._async_reads.add(read_task)
             read_task.add_done_callback(self._async_reads.discard)
@@ -386,12 +391,12 @@ class AWSCRTHTTPClient(http_aio_interfaces.HTTPClient):
             method=request.method,
             path=path,
             headers=headers,
-            body_stream=crt_body,
+            body_stream=body_stream,
         )
         return crt_request, crt_body
 
     async def _consume_body_async(
-        self, source: AsyncIterable[bytes], dest: "PipeByteStream"
+        self, source: AsyncIterable[bytes], dest: "BufferableByteStream | PipeByteStream"
     ) -> None:
         try:
             async for chunk in source:
@@ -410,6 +415,90 @@ class AWSCRTHTTPClient(http_aio_interfaces.HTTPClient):
         )
 
 
+# This is adapted from the transcribe streaming sdk
+class BufferableByteStream(BufferedIOBase):
+    """A non-blocking bytes buffer."""
+
+    def __init__(self) -> None:
+        # We're always manipulating the front and back of the buffer, so a deque
+        # will be much more efficient than a list.
+        self._chunks: deque[bytes] = deque()
+        self._closed = False
+        self._done = False
+
+    def read(self, size: int | None = -1) -> bytes:
+        if self._closed:
+            return b""
+
+        if len(self._chunks) == 0:
+            if self._done:
+                self.close()
+                return b""
+            else:
+                # When the CRT recieves this, it'll try again
+                raise BlockingIOError("read")
+
+        # We could compile all the chunks here instead of just returning
+        # the one, BUT the CRT will keep calling read until empty bytes
+        # are returned. So it's actually better to just return one chunk
+        # since combining them would have some potentially bad memory
+        # usage issues.
+        result = self._chunks.popleft()
+        if size is not None and size > 0:
+            remainder = result[size:]
+            result = result[:size]
+            if remainder:
+                self._chunks.appendleft(remainder)
+
+        if self._done and len(self._chunks) == 0:
+            self.close()
+
+        return result
+
+    def read1(self, size: int = -1) -> bytes:
+        return self.read(size)
+
+    def readinto(self, buffer: "WriteableBuffer") -> int:
+        if not isinstance(buffer, memoryview):
+            buffer = memoryview(buffer).cast("B")
+
+        data = self.read(len(buffer))  # type: ignore
+        n = len(data)
+        buffer[:n] = data
+        return n
+
+    def write(self, buffer: "ReadableBuffer") -> int:
+        if not isinstance(buffer, bytes):
+            raise ValueError(
+                f"Unexpected value written to BufferableByteStream. "
+                f"Only bytes are support but {type(buffer)} was provided."
+            )
+
+        if self._closed:
+            raise IOError("Stream is completed and doesn't support further writes.")
+
+        if buffer:
+            self._chunks.append(buffer)
+        return len(buffer)
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        self._closed = True
+        self._done = True
+
+        # Clear out the remaining chunks so that they don't sit around in memory.
+        self._chunks.clear()
+
+    def end_stream(self) -> None:
+        """End the stream, letting any remaining chunks be read before it is closed."""
+        if len(self._chunks) == 0:
+            self.close()
+        else:
+            self._done = True
+
 class PipeByteStream(BufferedIOBase):
     """A pipe based bytes buffer."""
 
@@ -417,6 +506,7 @@ class PipeByteStream(BufferedIOBase):
         self._read_fd, self._write_fd = os.pipe()
         self._closed = False
 
+    @property
     def read_fd(self):
         """The pipe's read file descriptor."""
         return self._read_fd
