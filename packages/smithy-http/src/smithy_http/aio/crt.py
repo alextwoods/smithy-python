@@ -3,6 +3,7 @@
 #  pyright: reportMissingTypeStubs=false,reportUnknownMemberType=false
 #  flake8: noqa: F811
 import asyncio
+import os
 from asyncio import Future as AsyncFuture
 from concurrent.futures import Future as ConcurrentFuture
 from collections import deque
@@ -259,7 +260,7 @@ class AWSCRTHTTPClient(http_aio_interfaces.HTTPClient):
         return response
 
     def _close_input_body(
-        self, future: ConcurrentFuture[int], *, body: "BufferableByteStream | BytesIO"
+        self, future: ConcurrentFuture[int], *, body: "PipeByteStream | BytesIO"
     ) -> None:
         if future.exception(timeout=0):
             body.close()
@@ -336,7 +337,7 @@ class AWSCRTHTTPClient(http_aio_interfaces.HTTPClient):
 
     async def _marshal_request(
         self, request: http_aio_interfaces.HTTPRequest
-    ) -> tuple["crt_http.HttpRequest", "BufferableByteStream | BytesIO"]:
+    ) -> tuple["crt_http.HttpRequest", "PipeByteStream | BytesIO"]:
         """Create :py:class:`awscrt.http.HttpRequest` from
         :py:class:`smithy_http.aio.HTTPRequest`"""
         headers_list = []
@@ -368,7 +369,7 @@ class AWSCRTHTTPClient(http_aio_interfaces.HTTPClient):
             # it into the intermediate object that CRT needs. By using
             # asyncio.create_task we'll start the coroutine without having to
             # explicitly await it.
-            crt_body = BufferableByteStream()
+            crt_body = PipeByteStream()
 
             if not isinstance(body, AsyncIterable):
                 body = AsyncBytesReader(body)
@@ -390,7 +391,7 @@ class AWSCRTHTTPClient(http_aio_interfaces.HTTPClient):
         return crt_request, crt_body
 
     async def _consume_body_async(
-        self, source: AsyncIterable[bytes], dest: "BufferableByteStream"
+        self, source: AsyncIterable[bytes], dest: "PipeByteStream"
     ) -> None:
         try:
             async for chunk in source:
@@ -409,45 +410,35 @@ class AWSCRTHTTPClient(http_aio_interfaces.HTTPClient):
         )
 
 
-# This is adapted from the transcribe streaming sdk
-class BufferableByteStream(BufferedIOBase):
-    """A non-blocking bytes buffer."""
+class PipeByteStream(BufferedIOBase):
+    """A pipe based bytes buffer."""
 
     def __init__(self) -> None:
-        # We're always manipulating the front and back of the buffer, so a deque
-        # will be much more efficient than a list.
-        self._chunks: deque[bytes] = deque()
+        self._read_fd, self._write_fd = os.pipe()
         self._closed = False
-        self._done = False
+
+    def read_fd(self):
+        """The pipe's read file descriptor."""
+        return self._read_fd
 
     def read(self, size: int | None = -1) -> bytes:
-        if self._closed:
-            return b""
+        """This method will block on os.read until data is available in the pipe.
 
-        if len(self._chunks) == 0:
-            if self._done:
-                self.close()
-                return b""
-            else:
-                # When the CRT recieves this, it'll try again
-                raise BlockingIOError("read")
+        Do NOT call this method from native C code that holds the GIL.
+        """
 
-        # We could compile all the chunks here instead of just returning
-        # the one, BUT the CRT will keep calling read until empty bytes
-        # are returned. So it's actually better to just return one chunk
-        # since combining them would have some potentially bad memory
-        # usage issues.
-        result = self._chunks.popleft()
-        if size is not None and size > 0:
-            remainder = result[size:]
-            result = result[:size]
-            if remainder:
-                self._chunks.appendleft(remainder)
+        if size is None or size < 0:
+            result = b""
+            while True:
+                chunk = os.read(self._read_fd, 1024)
+                if not chunk:
+                    break
+                result += chunk
 
-        if self._done and len(self._chunks) == 0:
-            self.close()
-
-        return result
+            return result
+        else:
+            # will return b'' if the pipe has been closed and fully drained.
+            return os.read(self._read_fd, size)
 
     def read1(self, size: int = -1) -> bytes:
         return self.read(size)
@@ -464,7 +455,7 @@ class BufferableByteStream(BufferedIOBase):
     def write(self, buffer: "ReadableBuffer") -> int:
         if not isinstance(buffer, bytes):
             raise ValueError(
-                f"Unexpected value written to BufferableByteStream. "
+                f"Unexpected value written to PipeByteStream. "
                 f"Only bytes are support but {type(buffer)} was provided."
             )
 
@@ -472,7 +463,7 @@ class BufferableByteStream(BufferedIOBase):
             raise IOError("Stream is completed and doesn't support further writes.")
 
         if buffer:
-            self._chunks.append(buffer)
+            os.write(self._write_fd, buffer)  # type: ignore
         return len(buffer)
 
     @property
@@ -481,14 +472,9 @@ class BufferableByteStream(BufferedIOBase):
 
     def close(self) -> None:
         self._closed = True
-        self._done = True
 
-        # Clear out the remaining chunks so that they don't sit around in memory.
-        self._chunks.clear()
+        print("Closing the write side of pipe....")
+        os.close(self._write_fd)
 
     def end_stream(self) -> None:
-        """End the stream, letting any remaining chunks be read before it is closed."""
-        if len(self._chunks) == 0:
-            self.close()
-        else:
-            self._done = True
+        self.close()
