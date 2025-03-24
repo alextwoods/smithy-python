@@ -410,7 +410,7 @@ class AWSCRTHTTPClient(http_aio_interfaces.HTTPClient):
         method: str,
     ):
         body_stream = PipeByteStream()
-        crt_body = crt_http.PipeInputStream(body_stream)
+        crt_body = crt_http.PipeInputStream(body_stream)  # type: ignore
         # Start the read task in the background.
         read_task = asyncio.create_task(self._consume_body_async(body, body_stream))
         self._async_reads.add(read_task)
