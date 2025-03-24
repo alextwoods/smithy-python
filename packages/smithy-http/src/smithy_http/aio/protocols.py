@@ -10,7 +10,8 @@ from smithy_core.exceptions import ExpectationNotMetException
 from smithy_core.interfaces import Endpoint, TypedProperties, URI
 from smithy_core.schemas import APIOperation
 from smithy_core.serializers import SerializeableShape
-from smithy_core.traits import HTTPTrait, EndpointTrait
+from smithy_core.traits import EndpointTrait, HTTPTrait
+
 from smithy_http.aio.interfaces import HTTPRequest, HTTPResponse
 from smithy_http.deserializers import HTTPResponseDeserializer
 from smithy_http.serializers import HTTPRequestSerializer
@@ -46,12 +47,12 @@ class HttpBindingClientProtocol(HttpClientProtocol):
     @property
     def payload_codec(self) -> Codec:
         """The codec used for the serde of input and output payloads."""
-        ...
+        raise NotImplementedError()
 
     @property
     def content_type(self) -> str:
         """The media type of the http payload."""
-        ...
+        raise NotImplementedError()
 
     def serialize_request[
         OperationInput: "SerializeableShape",
