@@ -419,7 +419,7 @@ class AWSCRTHTTPClient(http_aio_interfaces.HTTPClient):
             method=method,
             path=path,
             headers=headers,
-            body_stream=crt_body,
+            body_stream=crt_body, # type: ignore
         )
         return crt_request, body_stream
 
