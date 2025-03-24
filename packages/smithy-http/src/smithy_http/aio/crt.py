@@ -259,7 +259,10 @@ class AWSCRTHTTPClient(http_aio_interfaces.HTTPClient):
         return response
 
     def _close_input_body(
-        self, future: ConcurrentFuture[int], *, body: "BufferableByteStream | PipeByteStream | BytesIO"
+        self,
+        future: ConcurrentFuture[int],
+        *,
+        body: "BufferableByteStream | PipeByteStream | BytesIO",
     ) -> None:
         if future.exception(timeout=0):
             body.close()
@@ -336,7 +339,9 @@ class AWSCRTHTTPClient(http_aio_interfaces.HTTPClient):
 
     async def _marshal_request(
         self, request: http_aio_interfaces.HTTPRequest
-    ) -> tuple["crt_http.HttpRequest", "BufferableByteStream | PipeByteStream | BytesIO"]:
+    ) -> tuple[
+        "crt_http.HttpRequest", "BufferableByteStream | PipeByteStream | BytesIO"
+    ]:
         """Create :py:class:`awscrt.http.HttpRequest` from
         :py:class:`smithy_http.aio.HTTPRequest`"""
         headers_list = []
@@ -368,34 +373,60 @@ class AWSCRTHTTPClient(http_aio_interfaces.HTTPClient):
             # it into the intermediate object that CRT needs. By using
             # asyncio.create_task we'll start the coroutine without having to
             # explicitly await it.
-            if hasattr(crt_http, "PipeInputStream"):
-                crt_body = PipeByteStream()
-                body_stream = crt_http.PipeInputStream(crt_body)
-            else:
-                crt_body = BufferableByteStream()
-                body_stream = crt_body
-
             if not isinstance(body, AsyncIterable):
                 body = AsyncBytesReader(body)
 
-            # Start the read task in the background.
-            read_task = asyncio.create_task(self._consume_body_async(body, crt_body))
+            # If the CRT bindings support PipeInputStream, use it to avoid busy waiting.
+            if hasattr(crt_http, "PipeInputStream"):
+                return await self._marshal_request_pipe_input(
+                    body, headers, path, request.method
+                )
+            else:
+                crt_body = BufferableByteStream()
 
-            # Keep track of the read task so that it doesn't get garbage collected,
-            # and stop tracking it once it's done.
-            self._async_reads.add(read_task)
-            read_task.add_done_callback(self._async_reads.discard)
+                # Start the read task in the background.
+                read_task = asyncio.create_task(
+                    self._consume_body_async(body, crt_body)
+                )
+
+                # Keep track of the read task so that it doesn't get garbage collected,
+                # and stop tracking it once it's done.
+                self._async_reads.add(read_task)
+                read_task.add_done_callback(self._async_reads.discard)
 
         crt_request = crt_http.HttpRequest(
             method=request.method,
             path=path,
             headers=headers,
-            body_stream=body_stream,
+            body_stream=crt_body,
         )
         return crt_request, crt_body
 
+    async def _marshal_request_pipe_input(
+        self,
+        body: AsyncIterable[bytes],
+        headers: crt_http.HttpHeaders,
+        path: str,
+        method: str,
+    ):
+        body_stream = PipeByteStream()
+        crt_body = crt_http.PipeInputStream(body_stream)
+        # Start the read task in the background.
+        read_task = asyncio.create_task(self._consume_body_async(body, body_stream))
+        self._async_reads.add(read_task)
+        read_task.add_done_callback(self._async_reads.discard)
+        crt_request = crt_http.HttpRequest(
+            method=method,
+            path=path,
+            headers=headers,
+            body_stream=crt_body,
+        )
+        return crt_request, body_stream
+
     async def _consume_body_async(
-        self, source: AsyncIterable[bytes], dest: "BufferableByteStream | PipeByteStream"
+        self,
+        source: AsyncIterable[bytes],
+        dest: "BufferableByteStream | PipeByteStream",
     ) -> None:
         try:
             async for chunk in source:
@@ -498,8 +529,9 @@ class BufferableByteStream(BufferedIOBase):
         else:
             self._done = True
 
+
 class PipeByteStream(BufferedIOBase):
-    """A pipe based bytes buffer."""
+    """A pipe based bytes stream."""
 
     def __init__(self) -> None:
         self._read_fd, self._write_fd = os.pipe()
@@ -513,7 +545,9 @@ class PipeByteStream(BufferedIOBase):
     def read(self, size: int | None = -1) -> bytes:
         """This method will block on os.read until data is available in the pipe.
 
-        Do NOT call this method from native C code that holds the GIL.
+        Do NOT call read from native C code that holds the GIL.
+
+        Calling read with size None or < 0 will block until the input stream is closed.
         """
 
         if size is None or size < 0:
@@ -549,7 +583,7 @@ class PipeByteStream(BufferedIOBase):
             )
 
         if self._closed:
-            raise IOError("Stream is completed and doesn't support further writes.")
+            raise OSError("Stream is completed and doesn't support further writes.")
 
         if buffer:
             os.write(self._write_fd, buffer)  # type: ignore
@@ -561,8 +595,6 @@ class PipeByteStream(BufferedIOBase):
 
     def close(self) -> None:
         self._closed = True
-
-        print("Closing the write side of pipe....")
         os.close(self._write_fd)
 
     def end_stream(self) -> None:

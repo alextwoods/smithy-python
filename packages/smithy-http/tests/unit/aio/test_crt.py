@@ -11,7 +11,12 @@ from awscrt.http import HttpClientStream  # type: ignore
 from smithy_core import URI
 from smithy_http import Fields
 from smithy_http.aio import HTTPRequest
-from smithy_http.aio.crt import AWSCRTHTTPClient, BufferableByteStream, CRTResponseBody
+from smithy_http.aio.crt import (
+    AWSCRTHTTPClient,
+    BufferableByteStream,
+    CRTResponseBody,
+    PipeByteStream,
+)
 
 
 def test_deepcopy_client() -> None:
@@ -139,6 +144,36 @@ def test_end_stream() -> None:
     assert not stream.closed
     assert stream.read() == b"foo"
     assert stream.closed
+
+
+def test_pipe_stream_write() -> None:
+    stream = PipeByteStream()
+    stream.write(b"foo")
+    assert stream.read(size=3) == b"foo"
+
+
+def test_pipe_stream_read_all() -> None:
+    stream = PipeByteStream()
+    stream.write(b"foo")
+    stream.write(b"bar")
+    stream.close()
+    assert stream.read() == b"foobar"
+
+
+def test_pipe_stream_write_empty_bytes() -> None:
+    stream = PipeByteStream()
+    stream.write(b"")
+    stream.write(b"foo")
+    stream.write(b"")
+    stream.close()
+    assert stream.read() == b"foo"
+
+
+def test_closed_pipe_stream_write() -> None:
+    stream = PipeByteStream()
+    stream.close()
+    with pytest.raises(IOError):
+        stream.write(b"foo")
 
 
 async def test_response_body_completed_stream() -> None:
